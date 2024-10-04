@@ -17,7 +17,7 @@ The system comprises the following components:
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/yourusername/AWS-URL-Shrinker.git
+   git clone https://github.com/sallemiahmed/AWS-URL-Shrinker.git
    ```
 
 2. Modify the CloudFormation template `url-shrinker-s3-setup.yml` to fit your AWS environment.
