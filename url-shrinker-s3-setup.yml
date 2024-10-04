@@ -1,0 +1,194 @@
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: URL Shrinker Infrastructure with S3 Storage for URL mappings
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: The domain name for the URL shrinker (e.g., yourdomain.com)
+  HostedZoneName:
+    Type: String
+    Description: The hosted zone name (should match your domain)
+
+Resources:
+  # Route 53 Hosted Zone
+  HostedZone:
+    Type: "AWS::Route53::HostedZone"
+    Properties:
+      Name: !Ref HostedZoneName
+
+  # SSL/TLS Certificate from ACM
+  SSLCertificate:
+    Type: "AWS::CertificateManager::Certificate"
+    Properties: 
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZone
+
+  # S3 Bucket for Static Assets (Frontend)
+  S3Bucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Sub "${DomainName}-bucket"
+      AccessControl: Private
+
+  # S3 Bucket for Storing URL Mappings
+  UrlMappingsBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Sub "${DomainName}-url-mappings"
+      AccessControl: Private
+
+  # S3 Bucket Policy to restrict access
+  S3BucketPolicy:
+    Type: "AWS::S3::BucketPolicy"
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Statement:
+          - Action: "s3:GetObject"
+            Effect: "Allow"
+            Resource: !Sub "arn:aws:s3:::${S3Bucket}/*"
+            Principal:
+              Service: "cloudfront.amazonaws.com"
+            Condition:
+              StringEquals:
+                "AWS:SourceArn": !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+
+  # CloudFront OAC (Origin Access Control)
+  CloudFrontOAC:
+    Type: "AWS::CloudFront::OriginAccessControl"
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${DomainName}-OAC"
+        SigningBehavior: always
+        SigningProtocol: sigv4
+        OriginType: s3
+
+  # CloudFront Distribution
+  CloudFrontDistribution:
+    Type: "AWS::CloudFront::Distribution"
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Origins:
+          - Id: !Sub "${DomainName}-S3Origin"
+            DomainName: !GetAtt S3Bucket.DomainName
+            S3OriginConfig:
+              OriginAccessControlId: !Ref CloudFrontOAC
+        DefaultCacheBehavior:
+          TargetOriginId: !Sub "${DomainName}-S3Origin"
+          ViewerProtocolPolicy: "redirect-to-https"
+        ViewerCertificate:
+          AcmCertificateArn: !Ref SSLCertificate
+          SslSupportMethod: sni-only
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        DefaultRootObject: index.html
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "LambdaExecutionPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action: 
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "s3:PutObject"
+                  - "s3:GetObject"
+                Resource: !Sub "arn:aws:s3:::${UrlMappingsBucket}/*"
+
+  # Lambda Function for URL Shortening Logic (Storing in S3)
+  UrlShortenerLambda:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: "UrlShortenerLambda"
+      Handler: "index.handler"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: "nodejs14.x"
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const s3 = new AWS.S3();
+          const crypto = require('crypto');
+          
+          exports.handler = async (event) => {
+              const body = JSON.parse(event.body);
+              const longUrl = body.url;
+              
+              // Generate a short URL key
+              const shortUrl = crypto.randomBytes(4).toString('hex');
+              
+              // Store the mapping in S3 as a JSON file
+              const s3Params = {
+                  Bucket: process.env.URL_MAPPINGS_BUCKET,
+                  Key: shortUrl + '.json',
+                  Body: JSON.stringify({ longUrl: longUrl }),
+                  ContentType: "application/json"
+              };
+              
+              await s3.putObject(s3Params).promise();
+              
+              return {
+                  statusCode: 200,
+                  body: JSON.stringify({
+                      shortUrl: `https://${event.headers.Host}/${shortUrl}`
+                  })
+              };
+          };
+
+      Environment:
+        Variables:
+          URL_MAPPINGS_BUCKET: !Ref UrlMappingsBucket
+
+  # API Gateway for exposing Lambda
+  ApiGateway:
+    Type: "AWS::ApiGateway::RestApi"
+    Properties:
+      Name: "UrlShortenerAPI"
+
+  ApiResource:
+    Type: "AWS::ApiGateway::Resource"
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: "shorten"
+      RestApiId: !Ref ApiGateway
+
+  ApiMethod:
+    Type: "AWS::ApiGateway::Method"
+    Properties:
+      AuthorizationType: "NONE"
+      HttpMethod: "POST"
+      ResourceId: !Ref ApiResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        IntegrationHttpMethod: "POST"
+        Type: "AWS_PROXY"
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UrlShortenerLambda.Arn}/invocations"
+    
+  # Permission for API Gateway to invoke Lambda
+  LambdaApiPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref UrlShortenerLambda
+      Principal: "apigateway.amazonaws.com"
+    
